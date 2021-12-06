@@ -1,0 +1,257 @@
+// Wilson Electronic Time Capsule (v9) - Alan Wilson 2020
+// This uses a BME280 sensor to measure the enviroment, and then stores the data on an on-board flash chip
+// A DS3232 Real time clock is used to generate a timestamp and also to run an interrupt
+// AVR atmega328p with MiniCore framework is the microcontroller that runs the show.
+// Everything is kept at low power/sleep when not used, to give the unit a very long battery life.
+
+#include <Arduino.h>
+#include <avr/power.h>
+#include <avr/sleep.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SPIMemory.h>
+#include <SparkFunBME280.h>
+
+class DS3231{ //my own custom lib for control of the DS3231
+  uint8_t RTC_ADDR=0x68;
+  
+  uint8_t ztimeSecond;
+  uint8_t ztimeMinute;
+  uint8_t ztimeHour;
+  uint8_t ztimeDay;
+  uint8_t ztimeMonth;
+  uint8_t  ztimeYear;
+  uint8_t ztimeWeekday;
+
+  uint8_t za1rmb; //alarm register bits - set first, then set the time, day, month, etc to get this value into the clock
+  uint8_t za2rmb;
+
+  public:
+  DS3231(){ }
+  
+  static uint8_t bcd2bin (uint8_t val) { return val - 6 * (val >> 4); }
+  static uint8_t bin2bcd (uint8_t val) { return val + 6 * (val / 10); }
+  uint8_t read_register(uint8_t reg) {
+    Wire.beginTransmission(RTC_ADDR);
+    Wire.write((uint8_t)reg);
+    Wire.endTransmission();
+    Wire.requestFrom(RTC_ADDR, (uint8_t)1);
+    return Wire.read();
+  }
+  void write_register(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(RTC_ADDR);
+    Wire.write((uint8_t)reg);
+    Wire.write((uint8_t)val);
+    Wire.endTransmission();
+  }
+
+  void setTimeSecond(uint8_t temp){write_register(0x00, bin2bcd(temp));} 
+  void setTimeMinute(uint8_t temp){write_register(0x01, bin2bcd(temp));} 
+  void setTimeHour  (uint8_t temp){write_register(0x02, bin2bcd(temp));}
+  void setTimeDay   (uint8_t temp){write_register(0x04, bin2bcd(temp));}
+  void setTimeMonth (uint8_t temp){write_register(0x05, bin2bcd(temp));}
+  void setTimeYear  (int  temp){write_register(0x06, bin2bcd(temp));}
+  void validateClock(){ uint8_t bstat = read_register(0x0F); bstat &= ~0x80; write_register(0x0F, bstat); } //Clears OSF
+  bool lostPower(void){ return (read_register(0x0f) >> 7);}
+  void getTime(){
+    Wire.beginTransmission(RTC_ADDR); //set to location 0 (seconds)
+    Wire.write((uint8_t)0);  
+    Wire.endTransmission();
+    Wire.requestFrom(RTC_ADDR, (uint8_t)7);
+    ztimeSecond = bcd2bin(Wire.read() & 0x7F);
+    ztimeMinute = bcd2bin(Wire.read());
+    ztimeHour = bcd2bin(Wire.read());
+    Wire.read();
+    ztimeDay = bcd2bin(Wire.read());
+    ztimeMonth = bcd2bin(Wire.read());
+    ztimeYear = bcd2bin(Wire.read());
+  }
+  uint8_t csecond(){return ztimeSecond;}
+  uint8_t cminute(){return ztimeMinute;}
+  uint8_t chour  (){return ztimeHour;}
+  uint8_t cday   (){return ztimeDay;}
+  uint8_t cmonth (){return ztimeMonth;}
+  uint8_t cyear  (){return ztimeYear;}
+  uint8_t cweekday(){return ztimeWeekday;}
+  
+  void setAlarm1RMB(uint8_t temp){za1rmb=temp;}
+  void setAlarm1Second (uint8_t temp){write_register(0x07, ((1&(za1rmb>>0))<<7)+bin2bcd(temp)); } //set alarm bcd and bit 0 of alarm 1 register mask bit
+  void setAlarm1Minute (uint8_t temp){write_register(0x08, ((1&(za1rmb>>1))<<7)+bin2bcd(temp)); }
+  void setAlarm1Hour   (uint8_t temp){write_register(0x09, ((1&(za1rmb>>2))<<7)+bin2bcd(temp)); }
+  void setAlarm1Weekday(uint8_t temp){write_register(0x0a, (0b01000000)|(((1&(za1rmb>>3))<<7)+bin2bcd(temp))); } 
+  void setAlarm1Day    (uint8_t temp){write_register(0x0a, (~0b01000000)&(((1&(za1rmb>>3))<<7)+bin2bcd(temp))); } //if day is set, tell alarm to use it, otherwise, use weekday
+  
+  void useAlarm1onINT()    { uint8_t bcont = read_register(0x0e); bcont |= 0b00000001; write_register(0x0e, bcont); } //sets A1IE
+  void dontUseAlarm1onINT(){ uint8_t bcont = read_register(0x0e); bcont &=~0b00000001; write_register(0x0e, bcont); } //clears A1IE
+  void resetAlarm1()       { uint8_t bstat = read_register(0x0f); bstat &=~0b00000001; write_register(0x0f, bstat); } //clears alarm 1 flag
+  float getTemp(){
+    int8_t temp_msb, temp_lsb;
+    Wire.beginTransmission(RTC_ADDR);
+    Wire.write(0x11);
+    Wire.endTransmission();
+    Wire.requestFrom(RTC_ADDR, (uint8_t)2);
+    temp_msb =  Wire.read();
+    temp_lsb = (Wire.read() >> 6) & 0x03;
+    Wire.endTransmission();
+    if(temp_msb & 0b10000000) {     //check if negative number
+      temp_msb  ^= 0b11111111;
+      temp_msb  += 0x1;
+      return (-1.0 * ((float)temp_msb) + ((float)temp_lsb * 0.25));
+    }
+    else {
+      return ((float)temp_msb + ((float)temp_lsb * 0.25));
+    }
+  }
+ 
+};
+
+//board IO pins
+#define greenLed A0
+#define redLed A1
+#define yellowLed A2
+#define button 3       
+#define switch1 7      
+#define switch2 6        
+#define switch3 5      
+#define switch4 4 
+
+SPIFlash flash;
+DS3231 rtc;
+BME280 bme;
+
+struct frame_t{  //structure that stores each frame
+  unsigned long cycle;
+  byte  cyear;
+  byte  cmonth;
+  byte  cday;
+  byte  chour;
+  byte  cminute;
+  byte  csecond;
+  float tempeReading; 
+  float baromReading; 
+  float humidReading;
+  float ds3132temp; 
+  unsigned int bvoltadc;              
+  float spare; 
+};
+frame_t frame;
+
+unsigned long lastindex; //limit for frame
+unsigned long index;     //current index to store
+unsigned long icycle=0;  //current cycle (since atmega has been powered on)
+
+void wakeupInit(){
+  pinMode(button, INPUT_PULLUP);
+  pinMode(switch1, INPUT_PULLUP); 
+  pinMode(switch2, INPUT_PULLUP);
+  pinMode(switch3, INPUT_PULLUP);
+  pinMode(switch4, INPUT_PULLUP);
+  pinMode(greenLed, OUTPUT);
+  pinMode(redLed, OUTPUT);
+  pinMode(yellowLed, OUTPUT);
+  Serial.begin(115200);
+}
+void sleepInit(){
+  bme.settings.runMode = 0; delay(10); bme.begin(); //sleep the BME280
+  delay(1);
+  flash.powerDown();
+  delay(20);
+  ADCSRA = 0; //turn off ADCs
+  pinMode(switch1, INPUT); 
+  pinMode(switch2, INPUT);
+  pinMode(switch3, INPUT);
+  pinMode(switch4, INPUT);
+  pinMode(greenLed, INPUT);
+  pinMode(redLed, INPUT);
+  pinMode(yellowLed, INPUT);
+  Serial.end();
+  pinMode(0, INPUT);
+  pinMode(1, INPUT);
+
+  
+}
+
+
+void setup(){
+  Wire.begin();
+  SPI.begin(); //SPI is used for the Flash chip
+  SPI.beginTransaction(SPISettings(100000L,MSBFIRST,SPI_MODE0)); //start spi and set spi clock speed
+  delay(10);
+  pinMode(10, OUTPUT);
+  digitalWrite(10, LOW);
+  SPI.transfer(0xAB); //power up flash chip with raw command (in case is sleeping)
+  digitalWrite(10, HIGH);
+  delay(10);
+  SPI.endTransaction();
+  flash.begin(MB(4));
+
+  wakeupInit();
+  digitalWrite(yellowLed, HIGH);
+  digitalWrite(greenLed, HIGH);
+  digitalWrite(redLed, HIGH);
+  delay(300);
+  digitalWrite(yellowLed, LOW);
+  digitalWrite(greenLed, LOW);
+  digitalWrite(redLed, LOW);
+
+  Serial.println(F("TIME CAPSULE LONG DURATION ENVIROMENTAL LOGGER - v9(2020-12-17) - Alan J. WIlson"));
+  lastindex=flash.getCapacity()/sizeof(frame)-1; 
+  Serial.print(F("Flash capacity: "));Serial.print(flash.getCapacity()); Serial.print(F(" bytes, "));Serial.print(lastindex+1); Serial.println(F(" frames"));
+  Serial.print(F("Frame size: "));Serial.println(sizeof(frame));
+  Serial.print(F("Next ram index: "));
+  while(1){
+    if(!flash.readAnything(index*32, frame)){
+      Serial.println(F("Read failed!"));
+      break;
+      }
+      if(frame.cycle==4294967295){
+        break;
+      }
+      index++;
+    }
+  Serial.println(index);
+
+  //SETUP OF THE BME280 SENSOR
+  bme.settings.commInterface = I2C_MODE;
+  bme.settings.I2CAddress = 0x76;
+  bme.settings.runMode = 0; //3 for normal mode (ON), 0 for sleep mode (OFF)
+  bme.settings.tStandby = 0;
+  bme.settings.filter = 0;
+  bme.settings.tempOverSample = 1;
+  bme.settings.pressOverSample = 1;
+  bme.settings.humidOverSample = 1;
+  delay(10);
+  bme.begin();
+  delay(1000);
+  sleepInit();
+}
+
+void loop(){
+  bme.settings.runMode = 3; delay(10); bme.begin(); delay(10);
+
+  flash.powerUp(); delay(10);
+  flash.powerDown();
+  
+  index++;
+  icycle++; 
+  
+  delay(50);
+  digitalWrite(redLed, LOW); digitalWrite(greenLed, LOW); digitalWrite(yellowLed, LOW);
+
+  Serial.end();      //stop the serial port and turn serial pins to inputs
+  pinMode(1, INPUT);
+  pinMode(0, INPUT); 
+  
+  //***************************************************POWER OFF SECTION******************************************************
+  //keep_ADCSRA=ADCSRA;
+  ADCSRA = 0;                                       //disable ADCS
+  
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); 
+  sleep_enable();
+  noInterrupts();                                   //stop any interrups before sleeping
+  //attachInterrupt(0, wake, FALLING);                //goto 'wake' on interrupt (using clock alarm)
+  //attachInterrupt(1, wake, FALLING);                //goto 'wake' on interrupt (using button) 
+  EIFR = bit(INTF0);                                // clear flag for interrupt 0
+  interrupts();                                     //start interrups and 
+  sleep_cpu();                                   //then immediately sleep
+}
