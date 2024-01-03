@@ -12,9 +12,8 @@ import numpy as np
 
 #inputs
 input_dump_filename = 'envilog-time-capsule-2018.txt'
-chart_title = 'Conditions inside the Winter Camp XVII (2018) Time Capsule'
+chart_title = 'Conditions inside the Winter Camp XLII (2018) Time Capsule'
 start_skip = 177 #skip this many samples at the beginning
-
 chart_linewidth = .5
 chart_fontsize = 8
 #######
@@ -30,7 +29,7 @@ footer_index = 0
 for i, line in enumerate(lines):
     if line.startswith('Index'): #header of csv starts with 'Index'
         header_index = i
-    if 'nan' in line:
+    if 'nan' in line or 'ovf' in line: #end of data usually has overflow or nan error
         footer_index = i-header_index-1
         break
 header = lines[header_index].strip().split('\t')
